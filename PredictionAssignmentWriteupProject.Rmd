@@ -1,0 +1,210 @@
+---
+title: "Predicting Quality of Weight Lifting"
+author: "AK"
+date: "10/16/2016"
+output:
+  html_document:
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+  md_document:
+    variant: markdown_github
+  pdf_document:
+    keep_tex: true
+    fig_caption: yes
+    latex_engine: pdflatex
+    number_sections: yes
+    toc: yes
+  word_document:
+    fig_caption: yes
+csl: apa.csl
+bibliography: test.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+## Synopsis {-}
+This project is devoted to the construction of prediction model for the quality of weight lifting excersizes performed by a group of six young participants. The target activity quality variable is outcome variable `classe`. The rest of variables are activity monitors. 
+
+The data obtained from activity monitors is cleaned, analyzed and prediction models built based on cross validation, extreme gradient boosting  and out-of-sample error is estimated. Prediction model is used to predict 20 different cases. 
+
+## Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. 
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. This report is devoted to the prediction of the manner in which people do exercises. This is the `classe` variable in the training set. Data obtained from accelerometers on the *belt*, *forearm*, *arm*, and *dumbell* of six young health participants. 
+They were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). Class A corresponds to the specified execution of the exercise, while the other 4 classes correspond to common mistakes.
+
+## Source of Data
+
+Project source: | http://groupware.les.inf.puc-rio.br/har
+------------- | ---------------------------------
+Training set: | https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+Test set: | https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+## Loading required libraries
+Here we install all required libraries by using of pacman, convinient R package management tool.
+```{r libraries}
+# R package management tool
+if (!require("pacman")) {
+  install.packages("pacman", repos = "http://cran.us.r-project.org")
+}
+library(pacman)
+# Load required libraries
+p_load(plyr,dplyr,ggplot2,xgboost,knitr,caret,corrplot,rpart,rpart.plot,e1071,data.table)
+```
+
+## Getting, Cleaning and Filtering Data
+Original training dataset consists of 19622 observations  of 160 variables. Testing dataset has 20 observations of 160 variables. Target outcome variable is last `classe` variable. We take a look at this variable and count all observations corresponding each type of excersize (A,B,C,D,E).
+```{r download}
+train.url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+train.dl <- file.path(getwd(), "pml-training.csv")
+download.file(train.url, train.dl, method = "curl")
+train <- read.csv("./pml-training.csv", na.strings=c("NA", "", "#DIV/0!"))
+dim(train) 
+# names(train)
+test.url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+test.dl <- file.path(getwd(), "pml-testing.csv")
+download.file(test.url, test.dl, method = "curl")
+test <- read.csv("./pml-testing.csv", na.strings=c("NA", "", "#DIV/0!"))
+dim(test)
+# names(test)
+# To find # of observations for each type of activity (A,B,C,D,E)
+table(train$classe)
+# outcome variable
+clas.se = train[, "classe"]
+outcome = clas.se 
+# A, B, C, D, E character levels of outcome
+levels(outcome)
+# converting outcome to numeric for future use by xgboost
+levels(outcome) = 1:5
+str(outcome)
+```
+
+Based on analysis of dataset columns from 1 to 7 just represent information which is irrelevant for present goal of building prediction model and they will be dropped from the dataset. All columns containing NAs above 99% are removed. As it was mentioned in Synopsis data subset containing accelerometers on the *belt*, *forearm*, *arm*, and *dumbell* with corresponding keywords will be extracted. 
+
+```{r}
+# removing first 7 columns
+train_c <- train[, -c(1:7)]
+test_c <- test[, -c(1:7)]
+# rate of NAs in each column
+rate_na <- apply(train_c, 2, function(x) sum(is.na(x)))/dim(train_c)[1]
+# extract dataset with NAs percentage below 1%
+training <- train_c[(rate_na==0)]
+testing <- test_c[(rate_na==0)]
+dim(training)
+# Filtering data based on belt, forearm, arm, and dumbell excercizes
+filt1 <- grepl("arm|belt|dumbell|classe", names(training))
+# filtering out classe variable
+filt2 <- grepl("arm|belt|dumbell", names(training))
+train_f <- training[, filt1]
+test_f <- testing[, filt1]
+train_wo <- training[, filt2]
+test_wo <- testing[, filt2]
+dim(train_f) 
+names(train_f)
+```
+The extracted training dataset contains now 39 observation variables.
+
+## Finding variables with zero variance
+
+Variables having zero variability can not contribute in the building of the prediction model. Therefore we will remove them from dataset. 
+```{r}
+# Find variables with zero variance
+NZV = nearZeroVar(train_f, saveMetrics=TRUE)
+```
+The result of analysis confirms the absence of variables with zero variance. 
+
+## Correlation matrix
+
+To check correlation between variables we plot correlation matrix. As we can see from the plot most of variables are uncorrelated, which justifies that we can proceed without additional preprocessing with Principal Component Analysis. 
+```{r corrplot, fig.width=8, fig.height=8}
+# Correlation plot
+corrplot(cor(train_wo), order ="hclust", type = "upper")
+```
+
+## Superfast Extreme Gradient Boosting 
+
+XGBoost is working with matrices. Therefore we convert all our data into matrices.
+
+```{r }
+train.m <- as.matrix(train_wo)
+mode(train.m) <- "numeric"
+test.m <- as.matrix(test_wo)
+mode(test.m) <- "numeric"
+label <- as.matrix(as.integer(outcome)-1)
+# list of xgb parameters
+xgb_par<-list("objective" = "multi:softprob", "num_class" = 5, "eval_metric" = "merror",
+              "nthread" = 8, "max_depth" = 16, "eta" = 0.3, "gamma" = 0, "subsample" = 1, 
+              "colsample_bytree" = 1, "min_child_weight" = 12)
+```
+
+### Cross-validation
+```{r cv}
+set.seed(543)
+# 5-fold cross-validation
+cv7 <- xgb.cv(param=xgb_par, data=train.m, label=label, nfold=5, nrounds=100, prediction=TRUE, verbose=FALSE)
+```
+
+### Calculation of Confusion Matrix
+We calculate confusion matrix from the predictions of cross-validation.
+```{r}
+cv = matrix(cv7$pred, nrow=length(cv7$pred)/5, ncol=5)
+cv = max.col(cv, "last")
+# get confusion matrix
+confusionMatrix(factor(label+1), factor(cv))
+```
+
+### Real Model Fit Training
+Here we fit training data with gradient boosting model
+```{r}
+# minimum merror
+min.merror.idx <- which.min(cv7$dt[, test.merror.mean]) 
+# model fit training
+rmft <- xgboost(param=xgb_par, data=train.m, label=label, nrounds=min.merror.idx, verbose=0) 
+```
+
+### Testing Data Prediction 
+```{r}
+pred_test <- predict(rmft, test.m)  
+head(pred_test, 20)  
+```
+
+### Finalizing predictions
+```{r}
+predictiions = matrix(pred_test, nrow=5, ncol=length(pred_test)/5)
+predictiions = t(predictiions)
+predictiions = max.col(predictiions, "last")
+prd = toupper(letters[predictiions])
+```
+
+
+### Feature Importance Plot
+```{r, fig.height=8, fig.width=8}
+mod = xgb.dump(rmft, with.stats=TRUE)
+# get the feature all names
+allnames = dimnames(train.m)[[2]]
+# feature importance 
+importance_m <- xgb.importance(allnames, model=rmft)
+print(xgb.plot.importance(importance_m))
+```
+
+
+## Conclusions {-}
+Extreme Gradient Boosting method is very efficient linear model solver. It provides extremely good accuracy about 99.3 % with error rate less than 1 %.
+
+## Files submission {-}
+
+```{r submit}
+pml_write_files = function(x){
+        n = length(x)
+        for(i in 1:n){
+                filename = paste0("problem_id_",i,".txt")
+                write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+        }
+}
+pml_write_files(prd)
+```
+
